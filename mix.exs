@@ -7,6 +7,7 @@ defmodule Balsam.MixProject do
       version: "0.1.0",
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
+      elixirc_paths: elixirc_paths(Mix.env()),  # Add this line
       deps: deps(),
       aliases: aliases()
     ]
@@ -18,6 +19,10 @@ defmodule Balsam.MixProject do
       mod: {Balsam.Application, []}
     ]
   end
+
+  # Add this function inside the module
+  defp elixirc_paths(:test), do: ["lib", "etl", "test/support"]
+  defp elixirc_paths(_), do: ["lib", "etl"]
 
   defp deps do
     [

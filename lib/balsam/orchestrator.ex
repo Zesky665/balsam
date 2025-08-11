@@ -97,22 +97,22 @@ defmodule Balsam.Orchestrator do
   @doc """
   Get job execution history from database.
   """
-  def get_job_history(orchestrator \\ __MODULE__, job_id, opts \\ []) do
-    GenServer.call(orchestrator, {:get_job_history, job_id, opts})
+  def get_job_history(job_id, opts \\ []) do
+    GenServer.call(__MODULE__, {:get_job_history, job_id, opts})
   end
 
   @doc """
   Get job logs from database.
   """
-  def get_job_logs(orchestrator \\ __MODULE__, job_id, opts \\ []) do
-    GenServer.call(orchestrator, {:get_job_logs, job_id, opts})
+  def get_job_logs(job_id, opts \\ []) do
+    GenServer.call(__MODULE__, {:get_job_logs, job_id, opts})
   end
 
   @doc """
   Get job statistics from database.
   """
-  def get_job_statistics(orchestrator \\ __MODULE__, job_id, days_back \\ 30) do
-    GenServer.call(orchestrator, {:get_job_statistics, job_id, days_back})
+  def get_job_statistics(job_id, days_back \\ 30) do
+    GenServer.call(__MODULE__, {:get_job_statistics, job_id, days_back})
   end
 
   ## Server Implementation
