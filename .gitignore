@@ -24,3 +24,7 @@ balsam-*.tar
 
 # Elixir language server
 .elixir_ls/*
+*.db
+*.db-shm
+*.db-wal
+*.csv
