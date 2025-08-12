@@ -21,17 +21,16 @@ defmodule Balsam.Application do
         name: Balsam.DagOrchestrator,
         orchestrator_pid: Balsam.Orchestrator,
         max_concurrent_dags: 2
-      ]}
+      ]},
+
+      # Start the job loader (this will handle ETL job registration)
+      Balsam.StartupJobLoader
     ]
 
     opts = [strategy: :one_for_one, name: Balsam.Supervisor]
 
     case Supervisor.start_link(children, opts) do
       {:ok, pid} ->
-        :timer.sleep(100)
-        # Load jobs and DAGs from configuration modules
-        Balsam.JobRegistry.register_all()
-        Balsam.DagRegistry.register_all()
         Logger.info("Balsam Application started successfully")
         {:ok, pid}
       error ->
