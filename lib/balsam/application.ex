@@ -10,10 +10,17 @@ defmodule Balsam.Application do
       # Start Ecto repository first
       Balsam.Repo,
 
-      # Start the orchestrator
+      # Start the job orchestrator
       {Balsam.Orchestrator, [
         name: Balsam.Orchestrator,
-        max_concurrent_jobs: 3
+        max_concurrent_jobs: 5
+      ]},
+
+      # Start the DAG orchestrator
+      {Balsam.DagOrchestrator, [
+        name: Balsam.DagOrchestrator,
+        orchestrator_pid: Balsam.Orchestrator,
+        max_concurrent_dags: 2
       ]}
     ]
 
@@ -22,25 +29,13 @@ defmodule Balsam.Application do
     case Supervisor.start_link(children, opts) do
       {:ok, pid} ->
         :timer.sleep(100)
-        register_etl_jobs()  # Load from external config
+        # Load jobs and DAGs from configuration modules
+        Balsam.JobRegistry.register_all()
+        Balsam.DagRegistry.register_all()
         Logger.info("Balsam Application started successfully")
         {:ok, pid}
       error ->
         error
-    end
-  end
-
-  defp register_etl_jobs do
-    try do
-      Application.get_env(:balsam, :etl_jobs, [])
-      |> Enum.each(fn job_config ->
-        Balsam.Orchestrator.register_job(job_config.id, Map.delete(job_config, :id))
-      end)
-
-      Logger.info("ETL jobs registered successfully")
-    rescue
-      error ->
-        Logger.error("Failed to register ETL jobs: #{inspect(error)}")
     end
   end
 end
