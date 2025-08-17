@@ -14,7 +14,7 @@ defmodule Balsam.JobRunner do
 
     case JobStorage.start_job_run(job_id) do
       {:ok, job_run} ->
-        pid = spawn_link(fn ->
+        pid = spawn(fn ->
           execute_job(job_id, job_ref, workflow_config, progress_callback, job_run.id)
         end)
 
