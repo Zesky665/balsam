@@ -1,4 +1,4 @@
-defmodule ETL.Analytics.UserBehavior do
+defmodule Workflows.Analytics.UserBehavior do
   @behaviour Balsam.Workflow
 
   @impl true

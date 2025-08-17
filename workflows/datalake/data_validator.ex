@@ -1,4 +1,4 @@
-defmodule ETL.DataLake.DataValidator do
+defmodule Workflows.DataLake.DataValidator do
   require Logger
 
   def validate_files(source_files) do

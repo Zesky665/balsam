@@ -1,4 +1,4 @@
-defmodule ETL.DataLake.IngestionPipeline do
+defmodule Workflows.DataLake.IngestionPipeline do
   @behaviour Balsam.Workflow  # Change from Balsam.ETLJob
 
   @impl true

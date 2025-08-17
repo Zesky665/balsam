@@ -1,4 +1,4 @@
-defmodule ETL.Jokes.JokesETL do
+defmodule Workflows.Jokes.JokesETL do
   alias Explorer.DataFrame, as: DF
   import Enum
   import Req

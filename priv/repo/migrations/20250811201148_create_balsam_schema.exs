@@ -4,11 +4,11 @@ defmodule Balsam.Repo.Migrations.CreateBalsamTables do
   use Ecto.Migration
 
   def change do
-    # Schema Migrations - Ecto's internal table for tracking migrations
-    create table(:schema_migrations, primary_key: false) do
-      add :version, :bigint, primary_key: true
-      add :inserted_at, :naive_datetime
-    end
+    # # Schema Migrations - Ecto's internal table for tracking migrations
+    # create table(:schema_migrations, primary_key: false) do
+    #   add :version, :bigint, primary_key: true
+    #   add :inserted_at, :naive_datetime
+    # end
     # Job Definitions - stores registered job configurations
     create table(:job_definitions) do
       add :job_id, :string, null: false

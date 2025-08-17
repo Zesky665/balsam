@@ -1,4 +1,4 @@
-defmodule ETL.Shared.ProgressTracker do
+defmodule Workflows.Shared.ProgressTracker do
   @moduledoc """
   Consistent progress tracking across ETL pipelines.
   """

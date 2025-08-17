@@ -1,4 +1,4 @@
-defmodule ETL.Pipeline.TestPipeline do
+defmodule Workflows.Pipeline.TestPipeline do
   @behaviour Balsam.Workflow
 
   @impl true
