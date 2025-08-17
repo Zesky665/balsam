@@ -1,11 +1,20 @@
 # test/orchestrator_test.exs
 defmodule OrchestratorTest do
-  use ExUnit.Case
-  alias Balsam.{Orchestrator, WorkflowRegistry}
+  use ExUnit.Case, async: false  # Make sure it's not async
+  alias Balsam.{Orchestrator, WorkflowRegistry, Repo}
 
   setup do
+    # Set up clean database state in shared mode for spawned processes
+    :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo)
+    Ecto.Adapters.SQL.Sandbox.mode(Repo, {:shared, self()})
+
     # Start a clean orchestrator for each test
     {:ok, orchestrator} = Orchestrator.start_link(name: :"test_orchestrator_#{:rand.uniform(10000)}")
+
+    on_exit(fn ->
+      # Clean up shared mode
+      Ecto.Adapters.SQL.Sandbox.mode(Repo, :manual)
+    end)
 
     %{orchestrator: orchestrator}
   end
