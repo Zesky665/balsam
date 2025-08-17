@@ -1,25 +1,26 @@
 defmodule Balsam.Orchestrator do
   use GenServer
   require Logger
-  alias Balsam.JobStorage
+  alias Balsam.{Orchestrator, Repo, Schema.DagDefinition, Schema.DagNode, Schema.DagRun}
+  import Ecto.Query
 
   @moduledoc """
-  Production-ready orchestrator for ETL jobs with database persistence.
+  DAG orchestrator that coordinates execution of job dependencies.
 
   Features:
-  - Concurrent job execution with configurable limits
-  - Database persistence for job history and logs
-  - Real-time progress tracking
-  - Job scheduling and cancellation
-  - Comprehensive error handling and recovery
+  - Dependency resolution and parallel execution
+  - Integration with existing Balsam.Orchestrator for job execution
+  - Database persistence for DAG runs and node statuses
+  - Conditional node execution
+  - Retry logic at both DAG and node level
   """
 
   defstruct [
-    :jobs,
-    :running_jobs,
-    :supervisor_pid,
+    :dags,
+    :running_dag_runs,
+    :orchestrator_pid,
     :schedule_timer,
-    :max_concurrent_jobs
+    :max_concurrent_dags
   ]
 
   ## Client API
@@ -30,90 +31,86 @@ defmodule Balsam.Orchestrator do
   end
 
   @doc """
-  Register a new ETL job with the orchestrator.
+  Register a new DAG with the orchestrator.
 
   ## Options
 
-    * `:module` - Module containing the job function (required)
-    * `:function` - Function to call (required)
-    * `:args` - Arguments to pass to the function (default: [])
-    * `:schedule` - When to run: :manual or {:interval, milliseconds} (default: :manual)
-    * `:enable_progress` - Whether to enable progress tracking (default: false)
-    * `:max_retries` - Maximum retry attempts (default: 3)
-    * `:timeout` - Job timeout in milliseconds (default: :infinity)
+    * `:name` - Human-readable name for the DAG
+    * `:description` - Description of what this DAG does
+    * `:nodes` - Map of node configurations
+    * `:schedule` - When to run: :manual or {:interval, milliseconds}
+    * `:max_concurrent_nodes` - Maximum nodes to run simultaneously (default: 3)
 
-  ## Examples
+  ## Example
 
-      Balsam.Orchestrator.register_job(:daily_etl, %{
-        module: MyETL,
-        function: :process_daily_data,
-        args: [],
+      nodes = %{
+        extract: %{job_id: :data_extractor, depends_on: []},
+        transform: %{job_id: :data_transformer, depends_on: [:extract]},
+        load: %{job_id: :data_loader, depends_on: [:transform]}
+      }
+
+      Balsam.DagOrchestrator.register_dag(:etl_pipeline, %{
+        name: "Daily ETL Pipeline",
+        description: "Extract, transform, and load daily data",
+        nodes: nodes,
         schedule: {:interval, :timer.hours(24)},
-        enable_progress: true,
-        max_retries: 2
+        max_concurrent_nodes: 2
       })
   """
-  def register_job(orchestrator \\ __MODULE__, job_id, job_config) do
-    GenServer.call(orchestrator, {:register_job, job_id, job_config})
+  def register_dag(orchestrator \\ __MODULE__, dag_id, dag_config) do
+    GenServer.call(orchestrator, {:register_dag, dag_id, dag_config})
   end
 
   @doc """
-  Run a job immediately.
-
-  Returns `{:ok, task_ref}` on success or `{:error, reason}` on failure.
+  Run a DAG immediately.
   """
-  def run_job(orchestrator \\ __MODULE__, job_id) do
-    GenServer.call(orchestrator, {:run_job, job_id}, :infinity)
+  def run_dag(orchestrator \\ __MODULE__, dag_id, run_id \\ nil) do
+    GenServer.call(orchestrator, {:run_dag, dag_id, run_id}, :infinity)
   end
 
   @doc """
-  Cancel a running job.
+  Cancel a running DAG.
   """
-  def cancel_job(orchestrator \\ __MODULE__, job_id) do
-    GenServer.call(orchestrator, {:cancel_job, job_id})
+  def cancel_dag(orchestrator \\ __MODULE__, dag_id) do
+    GenServer.call(orchestrator, {:cancel_dag, dag_id})
   end
 
   @doc """
-  Get detailed status of a specific job.
+  Get status of a specific DAG.
   """
-  def job_status(orchestrator \\ __MODULE__, job_id) do
-    GenServer.call(orchestrator, {:job_status, job_id})
+  def dag_status(orchestrator \\ __MODULE__, dag_id) do
+    GenServer.call(orchestrator, {:dag_status, dag_id})
   end
 
   @doc """
-  List all currently running jobs.
+  List all currently running DAGs.
   """
-  def list_running_jobs(orchestrator \\ __MODULE__) do
-    GenServer.call(orchestrator, :list_running_jobs)
+  def list_running_dags(orchestrator \\ __MODULE__) do
+    GenServer.call(orchestrator, :list_running_dags)
   end
 
   @doc """
-  Get overall orchestrator status.
+  Get overall DAG orchestrator status.
   """
   def get_status(orchestrator \\ __MODULE__) do
     GenServer.call(orchestrator, :get_status)
   end
 
   @doc """
-  Get job execution history from database.
+  Get DAG execution history from database.
   """
-  def get_job_history(job_id, opts \\ []) do
-    GenServer.call(__MODULE__, {:get_job_history, job_id, opts})
+  def get_dag_history(dag_id, opts \\ []) do
+    GenServer.call(__MODULE__, {:get_dag_history, dag_id, opts})
   end
 
-  @doc """
-  Get job logs from database.
-  """
-  def get_job_logs(job_id, opts \\ []) do
-    GenServer.call(__MODULE__, {:get_job_logs, job_id, opts})
+  def cancel_job(orchestrator \\ __MODULE__, job_id) do
+    cancel_dag(orchestrator, job_id)
   end
 
-  @doc """
-  Get job statistics from database.
-  """
-  def get_job_statistics(job_id, days_back \\ 30) do
-    GenServer.call(__MODULE__, {:get_job_statistics, job_id, days_back})
+  def run_job(orchestrator \\ __MODULE__, job_id) do
+    run_dag(orchestrator, job_id)
   end
+
 
   ## Server Implementation
 
@@ -121,109 +118,106 @@ defmodule Balsam.Orchestrator do
   def init(opts) do
     Process.flag(:trap_exit, true)
 
-    {:ok, supervisor_pid} = Task.Supervisor.start_link()
-
     state = %__MODULE__{
-      jobs: %{},
-      running_jobs: %{},
-      supervisor_pid: supervisor_pid,
+      dags: %{},
+      running_dag_runs: %{},
+      orchestrator_pid: Keyword.get(opts, :orchestrator_pid, Orchestrator),
       schedule_timer: nil,
-      max_concurrent_jobs: Keyword.get(opts, :max_concurrent_jobs, 3)
+      max_concurrent_dags: Keyword.get(opts, :max_concurrent_dags, 2)
     }
 
-    # Load persisted job definitions
-    loaded_state = load_persisted_jobs(state)
+    # Load persisted DAG definitions
+    loaded_state = load_persisted_dags(state)
 
-    Logger.info("Orchestrator started with max #{loaded_state.max_concurrent_jobs} concurrent jobs")
-    Logger.info("Loaded #{map_size(loaded_state.jobs)} persisted job definitions")
+    Logger.info("DAG Orchestrator started with max #{loaded_state.max_concurrent_dags} concurrent DAGs")
+    Logger.info("Loaded #{map_size(loaded_state.dags)} persisted DAG definitions")
 
     {:ok, schedule_next_check(loaded_state)}
   end
 
   @impl true
-  def handle_call({:register_job, job_id, job_config}, _from, state) do
-    case validate_job_config(job_config) do
+  def handle_call({:register_dag, dag_id, dag_config}, _from, state) do
+    case validate_dag_config(dag_config) do
       {:ok, validated_config} ->
-        # Store in database for persistence
-        case persist_job_definition(job_id, validated_config) do
-          {:ok, _job_def} ->
-            updated_jobs = Map.put(state.jobs, job_id, validated_config)
-            Logger.info("Registered job: #{job_id} (schedule: #{inspect(validated_config.schedule)})")
-            {:reply, :ok, %{state | jobs: updated_jobs}}
+        case persist_dag_definition(dag_id, validated_config) do
+          {:ok, _dag_def} ->
+            updated_dags = Map.put(state.dags, dag_id, validated_config)
+            Logger.info("Registered DAG: #{dag_id} with #{map_size(validated_config.nodes)} nodes")
+            {:reply, :ok, %{state | dags: updated_dags}}
 
           {:error, reason} ->
-            Logger.error("Failed to persist job #{job_id}: #{inspect(reason)}")
+            Logger.error("Failed to persist DAG #{dag_id}: #{inspect(reason)}")
             {:reply, {:error, :persistence_failed}, state}
         end
 
       {:error, reason} ->
-        Logger.error("Failed to register job #{job_id}: #{reason}")
+        Logger.error("Failed to register DAG #{dag_id}: #{reason}")
         {:reply, {:error, reason}, state}
     end
   end
 
   @impl true
-  def handle_call({:run_job, job_id}, _from, state) do
+  def handle_call({:run_dag, dag_id, run_id}, _from, state) do
     cond do
-      not Map.has_key?(state.jobs, job_id) ->
-        {:reply, {:error, :job_not_found}, state}
+      not Map.has_key?(state.dags, dag_id) ->
+        {:reply, {:error, :dag_not_found}, state}
 
-      Map.has_key?(state.running_jobs, job_id) ->
-        {:reply, {:error, :job_already_running}, state}
-
-      map_size(state.running_jobs) >= state.max_concurrent_jobs ->
-        {:reply, {:error, :max_concurrent_jobs_reached}, state}
+      map_size(state.running_dag_runs) >= state.max_concurrent_dags ->
+        {:reply, {:error, :max_concurrent_dags_reached}, state}
 
       true ->
-        job_config = Map.get(state.jobs, job_id)
+        run_id = run_id || generate_run_id(dag_id)
+        dag_config = Map.get(state.dags, dag_id)
 
-        case start_job_run(state, job_id, job_config) do
-          {:ok, job_info} ->
-            new_running_jobs = Map.put(state.running_jobs, job_id, job_info)
-            Logger.info("Started job: #{job_id} (run_id: #{job_info.job_run_id})")
+        case start_dag_run(dag_id, run_id, dag_config) do
+          {:ok, dag_run_info} ->
+            new_running_dags = Map.put(state.running_dag_runs, run_id, dag_run_info)
+            Logger.info("Started DAG run: #{run_id}")
 
-            {:reply, {:ok, job_info.task_ref}, %{state | running_jobs: new_running_jobs}}
+            # Start the DAG execution process
+            GenServer.cast(self(), {:execute_dag, run_id})
+
+            {:reply, {:ok, run_id}, %{state | running_dag_runs: new_running_dags}}
 
           {:error, reason} = error ->
-            Logger.error("Failed to start job #{job_id}: #{inspect(reason)}")
+            Logger.error("Failed to start DAG #{dag_id}: #{inspect(reason)}")
             {:reply, error, state}
         end
     end
   end
 
   @impl true
-  def handle_call({:cancel_job, job_id}, _from, state) do
-    case Map.get(state.running_jobs, job_id) do
+  def handle_call({:cancel_dag, dag_id}, _from, state) do
+    case find_running_dag_by_dag_id(state.running_dag_runs, dag_id) do
       nil ->
-        {:reply, {:error, :job_not_running}, state}
+        {:reply, {:error, :dag_not_running}, state}
 
-      job_info ->
-        Task.Supervisor.terminate_child(state.supervisor_pid, job_info.task_pid)
+      {run_id, dag_run_info} ->
+        # Cancel all running nodes
+        Enum.each(dag_run_info.running_nodes, fn {node_id, job_ref} ->
+          Orchestrator.cancel_job(state.orchestrator_pid, job_ref)
+          Logger.info("Cancelled node #{node_id} in DAG run #{run_id}")
+        end)
 
-        # Mark as cancelled in database
-        JobStorage.complete_job_run(
-          job_info.job_run_id,
-          :cancelled,
-          nil,
-          "Job cancelled by user",
-          job_info.progress
-        )
-        JobStorage.log_job_message(job_id, :warning, "Job cancelled by user", %{}, job_info.job_run_id)
+        # Mark DAG as cancelled in database
+        complete_dag_run(dag_run_info.dag_run_id, :cancelled, %{
+          cancelled_nodes: Map.keys(dag_run_info.running_nodes)
+        })
 
-        new_running_jobs = Map.delete(state.running_jobs, job_id)
-        Logger.info("Cancelled job: #{job_id}")
+        new_running_dags = Map.delete(state.running_dag_runs, run_id)
+        Logger.info("Cancelled DAG run: #{run_id}")
 
-        {:reply, :ok, %{state | running_jobs: new_running_jobs}}
+        {:reply, :ok, %{state | running_dag_runs: new_running_dags}}
     end
   end
 
   @impl true
-  def handle_call({:job_status, job_id}, _from, state) do
-    case Map.get(state.running_jobs, job_id) do
+  def handle_call({:dag_status, dag_id}, _from, state) do
+    case find_running_dag_by_dag_id(state.running_dag_runs, dag_id) do
       nil ->
-        if Map.has_key?(state.jobs, job_id) do
+        if Map.has_key?(state.dags, dag_id) do
           # Check last run from database
-          case JobStorage.get_latest_job_run(job_id) do
+          case get_latest_dag_run(dag_id) do
             nil ->
               {:reply, {:ok, %{status: :never_run}}, state}
 
@@ -231,25 +225,29 @@ defmodule Balsam.Orchestrator do
               status = %{
                 status: :not_running,
                 last_run: %{
+                  run_id: last_run.run_id,
                   status: last_run.status,
                   started_at: last_run.started_at,
                   completed_at: last_run.completed_at,
-                  duration_ms: last_run.duration_ms
+                  duration_ms: last_run.duration_ms,
+                  node_statuses: last_run.node_statuses
                 }
               }
               {:reply, {:ok, status}, state}
           end
         else
-          {:reply, {:error, :job_not_found}, state}
+          {:reply, {:error, :dag_not_found}, state}
         end
 
-      job_info ->
+      {run_id, dag_run_info} ->
         status = %{
-          status: job_info.status,
-          started_at: job_info.started_at,
-          running_time_ms: System.system_time(:millisecond) - job_info.started_at,
-          progress: job_info.progress,
-          job_run_id: job_info.job_run_id
+          status: :running,
+          run_id: run_id,
+          started_at: dag_run_info.started_at,
+          running_time_ms: System.system_time(:millisecond) - dag_run_info.started_at,
+          completed_nodes: dag_run_info.completed_nodes,
+          running_nodes: Map.keys(dag_run_info.running_nodes),
+          failed_nodes: dag_run_info.failed_nodes
         }
 
         {:reply, {:ok, status}, state}
@@ -257,160 +255,110 @@ defmodule Balsam.Orchestrator do
   end
 
   @impl true
-  def handle_call(:list_running_jobs, _from, state) do
-    running_jobs = state.running_jobs
-    |> Enum.map(fn {job_id, job_info} ->
-      {job_id, %{
-        status: job_info.status,
-        started_at: job_info.started_at,
-        running_time_ms: System.system_time(:millisecond) - job_info.started_at,
-        progress: job_info.progress
+  def handle_call(:list_running_dags, _from, state) do
+    running_dags = state.running_dag_runs
+    |> Enum.map(fn {run_id, dag_run_info} ->
+      {run_id, %{
+        dag_id: dag_run_info.dag_id,
+        started_at: dag_run_info.started_at,
+        running_time_ms: System.system_time(:millisecond) - dag_run_info.started_at,
+        completed_nodes: length(dag_run_info.completed_nodes),
+        running_nodes: map_size(dag_run_info.running_nodes),
+        failed_nodes: length(dag_run_info.failed_nodes)
       }}
     end)
     |> Enum.into(%{})
 
-    {:reply, running_jobs, state}
+    {:reply, running_dags, state}
   end
 
   @impl true
   def handle_call(:get_status, _from, state) do
     status = %{
-      registered_jobs: Map.keys(state.jobs),
-      running_jobs: Map.keys(state.running_jobs),
-      running_count: map_size(state.running_jobs),
-      max_concurrent: state.max_concurrent_jobs,
-      available_slots: state.max_concurrent_jobs - map_size(state.running_jobs)
+      registered_dags: Map.keys(state.dags),
+      running_dag_count: map_size(state.running_dag_runs),
+      max_concurrent: state.max_concurrent_dags,
+      available_slots: state.max_concurrent_dags - map_size(state.running_dag_runs)
     }
     {:reply, status, state}
   end
 
   @impl true
-  def handle_call({:get_job_history, job_id, opts}, _from, state) do
-    history = JobStorage.list_job_runs(job_id, opts)
+  def handle_call({:get_dag_history, dag_id, opts}, _from, state) do
+    history = list_dag_runs(dag_id, opts)
     {:reply, history, state}
   end
 
+  ## Handle DAG execution
+  ## Handle node completion
   @impl true
-  def handle_call({:get_job_logs, job_id, opts}, _from, state) do
-    logs = JobStorage.get_job_logs(job_id, opts)
-    {:reply, logs, state}
-  end
-
-  @impl true
-  def handle_call({:get_job_statistics, job_id, days_back}, _from, state) do
-    stats = JobStorage.get_job_statistics(job_id, days_back)
-    {:reply, stats, state}
-  end
-
-  ## Handle job completion
-  @impl true
-  def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
-    case find_job_by_ref(state.running_jobs, ref) do
-      {job_id, job_info} ->
-        job_run_id = job_info.job_run_id
-
-        {db_status, result, error_message} = case reason do
-          :normal ->
-            JobStorage.log_job_message(job_id, :info, "Job completed successfully", %{}, job_run_id)
-            Logger.info("Job #{job_id} completed successfully")
-            {:completed, %{success: true}, nil}
-
-          {:shutdown, :timeout} ->
-            error_msg = "Job timeout"
-            JobStorage.log_job_message(job_id, :error, error_msg, %{}, job_run_id)
-            Logger.warning("Job #{job_id} timed out")
-            {:failed, nil, error_msg}
-
-          error ->
-            error_msg = "Job failed: #{inspect(error)}"
-            JobStorage.log_job_message(job_id, :error, error_msg, %{error: error}, job_run_id)
-            Logger.error("Job #{job_id} failed: #{inspect(error)}")
-            {:failed, nil, error_msg}
-        end
-
-        # Complete job run in database
-        JobStorage.complete_job_run(job_run_id, db_status, result, error_message, job_info.progress)
-
-        # Update last run time in both memory and database
-        current_time = System.system_time(:millisecond)
-        updated_job_config = Map.put(state.jobs[job_id], :last_run, current_time)
-        new_jobs = Map.put(state.jobs, job_id, updated_job_config)
-
-        # Persist the last run time
-        update_job_last_run(job_id, current_time)
-
-        # Remove from running jobs
-        new_running_jobs = Map.delete(state.running_jobs, job_id)
-
-        {:noreply, %{state | running_jobs: new_running_jobs, jobs: new_jobs}}
-
-      nil ->
-        Logger.warning("Received DOWN message for unknown job reference: #{inspect(ref)}")
-        {:noreply, state}
-    end
-  end
-
-  ## Handle progress updates
-  @impl true
-  def handle_info({:job_progress, job_id, progress_data}, state) do
-    case Map.get(state.running_jobs, job_id) do
+  def handle_info({:node_completed, run_id, node_id, result}, state) do
+    case Map.get(state.running_dag_runs, run_id) do
       nil ->
         {:noreply, state}
 
-      job_info ->
-        job_run_id = job_info.job_run_id
+      dag_run_info ->
+        Logger.info("Node #{node_id} in DAG run #{run_id} completed successfully")
 
-        # Store progress in database
-        JobStorage.record_progress(
-          job_id,
-          progress_data.current,
-          progress_data.total,
-          progress_data.message,
-          job_run_id
-        )
+        # Update DAG run info
+        updated_dag_run_info = dag_run_info
+        |> Map.update!(:completed_nodes, &[node_id | &1])
+        |> Map.update!(:running_nodes, &Map.delete(&1, node_id))
+        |> Map.update!(:node_results, &Map.put(&1, node_id, result))
 
-        # Log significant progress milestones
-        if should_log_progress_milestone?(progress_data.current, progress_data.total) do
-          percentage = calculate_percentage(progress_data.current, progress_data.total)
-          log_message = "Progress: #{progress_data.current}#{if progress_data.total, do: "/#{progress_data.total}"} #{if percentage, do: "(#{percentage}%)"} - #{progress_data.message}"
+        new_running_dags = Map.put(state.running_dag_runs, run_id, updated_dag_run_info)
+        new_state = %{state | running_dag_runs: new_running_dags}
 
-          # Simple progress context for database storage
-          simple_progress_context = %{
-            "current" => progress_data.current,
-            "total" => progress_data.total,
-            "percentage" => percentage
-          }
+        # Continue DAG execution
+        GenServer.cast(self(), {:execute_dag, run_id})
 
-          JobStorage.log_job_message(job_id, :info, log_message, simple_progress_context, job_run_id)
-        end
-
-        # Update in-memory state
-        updated_job_info = put_in(job_info.progress, progress_data)
-        new_running_jobs = Map.put(state.running_jobs, job_id, updated_job_info)
-
-        {:noreply, %{state | running_jobs: new_running_jobs}}
+        {:noreply, new_state}
     end
   end
 
-  ## Handle scheduled job execution
   @impl true
-  def handle_info(:check_scheduled_jobs, state) do
-    available_slots = state.max_concurrent_jobs - map_size(state.running_jobs)
+  def handle_info({:node_failed, run_id, node_id, error}, state) do
+    case Map.get(state.running_dag_runs, run_id) do
+      nil ->
+        {:noreply, state}
+
+      dag_run_info ->
+        Logger.error("Node #{node_id} in DAG run #{run_id} failed: #{inspect(error)}")
+
+        # Update DAG run info
+        updated_dag_run_info = dag_run_info
+        |> Map.update!(:failed_nodes, &[node_id | &1])
+        |> Map.update!(:running_nodes, &Map.delete(&1, node_id))
+
+        new_running_dags = Map.put(state.running_dag_runs, run_id, updated_dag_run_info)
+        new_state = %{state | running_dag_runs: new_running_dags}
+
+        # Continue DAG execution (may complete due to failure)
+        GenServer.cast(self(), {:execute_dag, run_id})
+
+        {:noreply, new_state}
+    end
+  end
+
+  ## Handle scheduled DAG execution
+  @impl true
+  def handle_info(:check_scheduled_dags, state) do
+    available_slots = state.max_concurrent_dags - map_size(state.running_dag_runs)
 
     if available_slots > 0 do
       try do
-        due_jobs = state.jobs
-        |> Enum.filter(fn {job_id, job_config} ->
-          should_run_job?(job_config) and not Map.has_key?(state.running_jobs, job_id)
+        due_dags = state.dags
+        |> Enum.filter(fn {dag_id, dag_config} ->
+          should_run_dag?(dag_config) and not is_dag_running?(state.running_dag_runs, dag_id)
         end)
         |> Enum.take(available_slots)
 
-        Enum.each(due_jobs, fn {job_id, _config} ->
-          GenServer.cast(self(), {:start_scheduled_job, job_id})
+        Enum.each(due_dags, fn {dag_id, _config} ->
+          GenServer.cast(self(), {:start_scheduled_dag, dag_id})
         end)
       rescue
         error ->
-          Logger.error("Error in scheduled job check: #{inspect(error)}")
+          Logger.error("Error in scheduled DAG check: #{inspect(error)}")
       end
     end
 
@@ -418,134 +366,371 @@ defmodule Balsam.Orchestrator do
   end
 
   @impl true
-  def handle_cast({:start_scheduled_job, job_id}, state) do
-    case handle_call({:run_job, job_id}, nil, state) do
-      {:reply, {:ok, _ref}, new_state} ->
-        {:noreply, new_state}
+  def handle_cast({:execute_dag, run_id}, state) do
+    case Map.get(state.running_dag_runs, run_id) do
+      nil ->
+        Logger.warning("Received execute_dag for unknown run_id: #{run_id}")
+        {:noreply, state}
 
-      {:reply, error, new_state} ->
-        Logger.warning("Failed to start scheduled job #{job_id}: #{inspect(error)}")
+      dag_run_info ->
+        new_state = execute_dag_step(state, run_id, dag_run_info)
         {:noreply, new_state}
     end
   end
 
+  @impl true
+  def handle_cast({:start_scheduled_dag, dag_id}, state) do
+    case handle_call({:run_dag, dag_id, nil}, nil, state) do
+      {:reply, {:ok, _run_id}, new_state} ->
+        {:noreply, new_state}
+
+      {:reply, error, new_state} ->
+        Logger.warning("Failed to start scheduled DAG #{dag_id}: #{inspect(error)}")
+        {:noreply, new_state}
+    end
+  end
+
+
   ## Private Functions
 
-  defp validate_job_config(config) when is_map(config) do
-    required_fields = [:module, :function]
+  defp validate_dag_config(config) when is_map(config) do
+    required_fields = [:nodes]
 
     case Enum.find(required_fields, fn field -> not Map.has_key?(config, field) end) do
       nil ->
-        defaults = %{
-          args: [],
-          schedule: :manual,
-          last_run: nil,
-          max_retries: 3,
-          timeout: :infinity,
-          enable_progress: false
-        }
+        case validate_dag_structure(config.nodes) do
+          :ok ->
+            defaults = %{
+              name: "Unnamed DAG",
+              description: "",
+              schedule: :manual,
+              last_run: nil,
+              max_concurrent_nodes: 3,
+              max_retries: 3,
+              timeout: :infinity
+            }
 
-        validated_config = Map.merge(defaults, config)
-        {:ok, validated_config}
+            validated_config = Map.merge(defaults, config)
+            {:ok, validated_config}
+
+          {:error, reason} ->
+            {:error, reason}
+        end
 
       missing_field ->
         {:error, "Missing required field: #{missing_field}"}
     end
   end
-  defp validate_job_config(_), do: {:error, "Job config must be a map"}
+  defp validate_dag_config(_), do: {:error, "DAG config must be a map"}
 
-  defp start_job_run(state, job_id, job_config) do
-    # Create job run record in database
-    case JobStorage.start_job_run(job_id, %{config: job_config}) do
-      {:ok, job_run} ->
-        case start_job_task(state, job_id, job_config, job_run.id) do
-          {:ok, task_pid, task_ref} ->
-            job_info = %{
-              task_pid: task_pid,
-              task_ref: task_ref,
-              job_run_id: job_run.id,
-              started_at: System.system_time(:millisecond),
-              status: :running,
-              progress: %{message: "Starting...", current: 0, total: nil}
-            }
+  defp validate_dag_structure(nodes) when is_map(nodes) do
+    # Check for cycles and validate dependencies
+    node_ids = Map.keys(nodes) |> MapSet.new()
 
-            JobStorage.log_job_message(job_id, :info, "Job started", %{}, job_run.id)
-            {:ok, job_info}
+    # Validate all dependencies exist
+    case Enum.find(nodes, fn {_node_id, node_config} ->
+      depends_on = node_config[:depends_on] || []
+      not Enum.all?(depends_on, &MapSet.member?(node_ids, &1))
+    end) do
+      {node_id, _config} ->
+        {:error, "Node #{node_id} has invalid dependencies"}
 
-          error ->
-            JobStorage.complete_job_run(job_run.id, :failed, nil, "Failed to start: #{inspect(error)}")
-            error
+      nil ->
+        # Check for cycles using DFS
+        case detect_cycles(nodes) do
+          nil -> :ok
+          cycle -> {:error, "Cycle detected: #{inspect(cycle)}"}
         end
+    end
+  end
+  defp validate_dag_structure(_), do: {:error, "Nodes must be a map"}
+
+  defp detect_cycles(nodes) do
+    visited = MapSet.new()
+    rec_stack = MapSet.new()
+
+    Enum.find_value(Map.keys(nodes), fn node_id ->
+      if not MapSet.member?(visited, node_id) do
+        case dfs_cycle_check(node_id, nodes, visited, rec_stack, []) do
+          {:cycle, path} -> path
+          :no_cycle -> nil
+        end
+      end
+    end)
+  end
+
+  defp dfs_cycle_check(node_id, nodes, visited, rec_stack, path) do
+    if MapSet.member?(rec_stack, node_id) do
+      {:cycle, Enum.reverse([node_id | path])}
+    else
+      if not MapSet.member?(visited, node_id) do
+        visited = MapSet.put(visited, node_id)
+        rec_stack = MapSet.put(rec_stack, node_id)
+        new_path = [node_id | path]
+
+        node_config = Map.get(nodes, node_id, %{})
+        depends_on = node_config[:depends_on] || []
+
+        case Enum.find_value(depends_on, fn dep ->
+          case dfs_cycle_check(dep, nodes, visited, rec_stack, new_path) do
+            {:cycle, cycle_path} -> {:cycle, cycle_path}
+            :no_cycle -> nil
+          end
+        end) do
+          {:cycle, cycle_path} -> {:cycle, cycle_path}
+          nil -> :no_cycle
+        end
+      else
+        :no_cycle
+      end
+    end
+  end
+
+  defp start_dag_run(dag_id, run_id, dag_config) do
+    # Create DAG run record in database
+    attrs = %{
+      dag_id: to_string(dag_id),
+      run_id: run_id,
+      started_at: DateTime.utc_now(),
+      metadata: inspect(%{config: dag_config})
+    }
+
+    case %DagRun{}
+         |> DagRun.start_changeset(attrs)
+         |> Repo.insert() do
+      {:ok, dag_run} ->
+        dag_run_info = %{
+          dag_id: dag_id,
+          dag_run_id: dag_run.id,
+          dag_config: dag_config,
+          started_at: System.system_time(:millisecond),
+          completed_nodes: [],
+          running_nodes: %{},
+          failed_nodes: [],
+          node_results: %{}
+        }
+
+        Logger.info("Started DAG run #{run_id} for DAG #{dag_id}")
+        {:ok, dag_run_info}
 
       error ->
-        Logger.error("Failed to create job run record: #{inspect(error)}")
+        Logger.error("Failed to create DAG run record: #{inspect(error)}")
         {:error, :database_error}
     end
   end
 
-  defp start_job_task(state, job_id, job_config, job_run_id) do
-    orchestrator_pid = self()
+  defp execute_dag_step(state, run_id, dag_run_info) do
+    # Check if DAG is complete
+    cond do
+      dag_complete?(dag_run_info) ->
+        complete_dag_run_and_cleanup(state, run_id, dag_run_info)
 
-    task_fun = fn ->
-      # Set up progress callback
-      progress_callback = if job_config.enable_progress do
-        fn current, total, message ->
-          progress_data = %{current: current, total: total, message: message}
-          send(orchestrator_pid, {:job_progress, job_id, progress_data})
-        end
-      else
-        nil
-      end
+      dag_failed?(dag_run_info) ->
+        fail_dag_run_and_cleanup(state, run_id, dag_run_info)
 
-      try do
-        module = job_config.module
-        function = job_config.function
-        args = job_config.args
-
-        # Add progress callback to args if enabled
-        enhanced_args = if progress_callback do
-          args ++ [progress_callback]
-        else
-          args
-        end
-
-        JobStorage.log_job_message(job_id, :info, "Executing #{module}.#{function}", %{args: length(enhanced_args)}, job_run_id)
-
-        result = apply(module, function, enhanced_args)
-        {:ok, result}
-      rescue
-        error ->
-          # Create a simple error context that can be serialized
-          simple_error_context = %{
-            "error_type" => error.__struct__ |> to_string(),
-            "error_message" => Exception.message(error)
-          }
-
-          JobStorage.log_job_message(job_id, :error, "Job execution failed: #{Exception.message(error)}", simple_error_context, job_run_id)
-          {:error, error}
-      end
+      true ->
+        # Find ready nodes and start them
+        start_ready_nodes(state, run_id, dag_run_info)
     end
+  end
 
-    case Task.Supervisor.start_child(state.supervisor_pid, task_fun) do
-      {:ok, task_pid} ->
-        task_ref = Process.monitor(task_pid)
-        {:ok, task_pid, task_ref}
+  defp dag_complete?(dag_run_info) do
+    total_nodes = map_size(dag_run_info.dag_config.nodes)
+    completed_count = length(dag_run_info.completed_nodes)
+    running_count = map_size(dag_run_info.running_nodes)
+
+    completed_count + running_count == total_nodes and running_count == 0
+  end
+
+  defp dag_failed?(dag_run_info) do
+    # DAG fails if there are failed nodes and no nodes can proceed
+    length(dag_run_info.failed_nodes) > 0 and
+      get_ready_nodes(dag_run_info) == [] and
+      map_size(dag_run_info.running_nodes) == 0
+  end
+
+  defp start_ready_nodes(state, run_id, dag_run_info) do
+    ready_nodes = get_ready_nodes(dag_run_info)
+    max_concurrent = dag_run_info.dag_config.max_concurrent_nodes
+    current_running = map_size(dag_run_info.running_nodes)
+    available_slots = max(0, max_concurrent - current_running)
+
+    nodes_to_start = Enum.take(ready_nodes, available_slots)
+
+    updated_dag_run_info = Enum.reduce(nodes_to_start, dag_run_info, fn node_id, acc ->
+      case start_dag_node(state, run_id, node_id, acc) do
+        {:ok, job_ref} ->
+          Map.update!(acc, :running_nodes, &Map.put(&1, node_id, job_ref))
+
+        {:error, reason} ->
+          Logger.error("Failed to start node #{node_id}: #{inspect(reason)}")
+          Map.update!(acc, :failed_nodes, &[node_id | &1])
+      end
+    end)
+
+    Map.put(state.running_dag_runs, run_id, updated_dag_run_info)
+    |> then(&%{state | running_dag_runs: &1})
+  end
+
+  defp get_ready_nodes(dag_run_info) do
+    completed_set = MapSet.new(dag_run_info.completed_nodes)
+    running_set = MapSet.new(Map.keys(dag_run_info.running_nodes))
+    failed_set = MapSet.new(dag_run_info.failed_nodes)
+
+    dag_run_info.dag_config.nodes
+    |> Enum.filter(fn {node_id, node_config} ->
+      # Node is ready if:
+      # 1. Not already completed, running, or failed
+      # 2. All dependencies are completed
+      # 3. Condition is met (if any)
+      not MapSet.member?(completed_set, node_id) and
+      not MapSet.member?(running_set, node_id) and
+      not MapSet.member?(failed_set, node_id) and
+      dependencies_satisfied?(node_config, completed_set) and
+      condition_satisfied?(node_config, dag_run_info.node_results)
+    end)
+    |> Enum.map(fn {node_id, _} -> node_id end)
+  end
+
+  defp dependencies_satisfied?(node_config, completed_set) do
+    depends_on = node_config[:depends_on] || []
+    Enum.all?(depends_on, &MapSet.member?(completed_set, &1))
+  end
+
+  defp condition_satisfied?(node_config, node_results) do
+    case {node_config[:condition_module], node_config[:condition_function]} do
+      {nil, nil} -> true
+      {module_name, function_name} when is_binary(module_name) and is_binary(function_name) ->
+        try do
+          module = String.to_existing_atom("Elixir.#{module_name}")
+          function = String.to_existing_atom(function_name)
+          apply(module, function, [node_results])
+        rescue
+          error ->
+            Logger.error("Condition check failed: #{inspect(error)}")
+            false
+        end
+      _ -> true
+    end
+  end
+
+  defp start_dag_node(state, run_id, node_id, dag_run_info) do
+    node_config = Map.get(dag_run_info.dag_config.nodes, node_id)
+    job_id = node_config.job_id
+
+    # Start the job through the regular orchestrator
+    case Orchestrator.run_job(state.orchestrator_pid, job_id) do
+      {:ok, job_ref} ->
+        # Monitor the job completion
+        spawn_link(fn ->
+          monitor_dag_node(run_id, node_id, job_ref, self())
+        end)
+
+        Logger.info("Started node #{node_id} (job #{job_id}) in DAG run #{run_id}")
+        {:ok, job_ref}
 
       error ->
         error
     end
   end
 
-  defp find_job_by_ref(running_jobs, ref) do
-    Enum.find(running_jobs, fn {_job_id, job_info} ->
-      job_info.task_ref == ref
+  defp monitor_dag_node(run_id, node_id, job_ref, dag_orchestrator_pid) do
+    # This function would monitor the job completion
+    # In practice, you'd integrate with your existing job monitoring
+    # For now, we'll simulate with a simple approach
+    receive do
+      {:job_completed, ^job_ref, result} ->
+        send(dag_orchestrator_pid, {:node_completed, run_id, node_id, result})
+
+      {:job_failed, ^job_ref, error} ->
+        send(dag_orchestrator_pid, {:node_failed, run_id, node_id, error})
+    after
+      :timer.minutes(30) ->  # Timeout
+        send(dag_orchestrator_pid, {:node_failed, run_id, node_id, :timeout})
+    end
+  end
+
+  defp complete_dag_run_and_cleanup(state, run_id, dag_run_info) do
+    Logger.info("DAG run #{run_id} completed successfully")
+
+    # Update database
+    complete_dag_run(dag_run_info.dag_run_id, :completed, %{
+      completed_nodes: dag_run_info.completed_nodes,
+      node_results: dag_run_info.node_results
+    })
+
+    # Update last run time
+    current_time = System.system_time(:millisecond)
+    updated_dag_config = Map.put(dag_run_info.dag_config, :last_run, current_time)
+    new_dags = Map.put(state.dags, dag_run_info.dag_id, updated_dag_config)
+    update_dag_last_run(dag_run_info.dag_id, current_time)
+
+    # Remove from running DAGs
+    new_running_dags = Map.delete(state.running_dag_runs, run_id)
+
+    %{state | running_dag_runs: new_running_dags, dags: new_dags}
+  end
+
+  defp fail_dag_run_and_cleanup(state, run_id, dag_run_info) do
+    Logger.error("DAG run #{run_id} failed")
+
+    # Update database
+    complete_dag_run(dag_run_info.dag_run_id, :failed, %{
+      completed_nodes: dag_run_info.completed_nodes,
+      failed_nodes: dag_run_info.failed_nodes,
+      node_results: dag_run_info.node_results
+    })
+
+    # Remove from running DAGs
+    new_running_dags = Map.delete(state.running_dag_runs, run_id)
+
+    %{state | running_dag_runs: new_running_dags}
+  end
+
+  defp complete_dag_run(dag_run_id, status, results) do
+    try do
+      dag_run = Repo.get!(DagRun, dag_run_id)
+
+      attrs = %{
+        status: status,
+        completed_at: DateTime.utc_now(),
+        node_statuses: convert_to_status_map(results),
+        node_results: results[:node_results] || %{}
+      }
+
+      dag_run
+      |> DagRun.complete_changeset(attrs)
+      |> Repo.update()
+    rescue
+      error ->
+        Logger.error("Failed to complete DAG run #{dag_run_id}: #{inspect(error)}")
+    end
+  end
+
+  defp convert_to_status_map(results) do
+    completed = results[:completed_nodes] || []
+    failed = results[:failed_nodes] || []
+
+    completed_map = Enum.into(completed, %{}, fn node -> {node, "completed"} end)
+    failed_map = Enum.into(failed, %{}, fn node -> {node, "failed"} end)
+
+    Map.merge(completed_map, failed_map)
+  end
+
+  defp find_running_dag_by_dag_id(running_dag_runs, dag_id) do
+    Enum.find(running_dag_runs, fn {_run_id, dag_run_info} ->
+      dag_run_info.dag_id == dag_id
     end)
   end
 
-  defp should_run_job?(job_config) when is_map(job_config) do
-    case Map.get(job_config, :schedule) do
+  defp is_dag_running?(running_dag_runs, dag_id) do
+    find_running_dag_by_dag_id(running_dag_runs, dag_id) != nil
+  end
+
+  defp should_run_dag?(dag_config) when is_map(dag_config) do
+    case Map.get(dag_config, :schedule) do
       {:interval, interval_ms} ->
-        case Map.get(job_config, :last_run) do
+        case Map.get(dag_config, :last_run) do
           nil -> true
           last_run -> System.system_time(:millisecond) - last_run >= interval_ms
         end
@@ -555,91 +740,169 @@ defmodule Balsam.Orchestrator do
     end
   end
 
-  defp should_log_progress_milestone?(current, total) when is_integer(total) and total > 0 do
-    percentage = trunc(current / total * 100)
-    rem(percentage, 25) == 0 and percentage > 0  # Log at 25%, 50%, 75%, 100%
+  defp generate_run_id(dag_id) do
+    timestamp = System.system_time(:millisecond)
+    "#{dag_id}_#{timestamp}"
   end
-  defp should_log_progress_milestone?(_, _), do: false
-
-  defp calculate_percentage(current, total) when is_integer(total) and total > 0 do
-    trunc(current / total * 100)
-  end
-  defp calculate_percentage(_, _), do: nil
 
   defp schedule_next_check(state) do
     if state.schedule_timer do
       Process.cancel_timer(state.schedule_timer)
     end
 
-    # Check for scheduled jobs every minute
-    timer = Process.send_after(self(), :check_scheduled_jobs, :timer.minutes(1))
+    # Check for scheduled DAGs every 2 minutes
+    timer = Process.send_after(self(), :check_scheduled_dags, :timer.minutes(2))
     %{state | schedule_timer: timer}
   end
 
-  defp load_persisted_jobs(state) do
+  defp load_persisted_dags(state) do
     try do
-      import Ecto.Query
-      alias Balsam.{Repo, Schema.JobDefinition}
-
-      job_definitions = from(jd in JobDefinition, where: jd.active == true)
+      # Load DAG definitions and their nodes
+      dag_definitions = from(dd in DagDefinition, where: dd.active == true)
       |> Repo.all()
 
-      persisted_jobs = job_definitions
-      |> Enum.reduce(%{}, fn job_def, acc ->
-        case JobDefinition.to_config(job_def) do
-          {:ok, config} ->
-            job_id = String.to_existing_atom(job_def.job_id)
-            Map.put(acc, job_id, config)
+      persisted_dags = dag_definitions
+      |> Enum.reduce(%{}, fn dag_def, acc ->
+        case load_dag_nodes(dag_def) do
+          {:ok, dag_config} ->
+            dag_id = String.to_existing_atom(dag_def.dag_id)
+            Map.put(acc, dag_id, dag_config)
 
           {:error, reason} ->
-            Logger.warning("Failed to load job definition #{job_def.job_id}: #{inspect(reason)}")
+            Logger.warning("Failed to load DAG definition #{dag_def.dag_id}: #{inspect(reason)}")
             acc
         end
       end)
 
-      %{state | jobs: persisted_jobs}
+      %{state | dags: persisted_dags}
     rescue
       error ->
-        Logger.warning("Failed to load persisted jobs: #{inspect(error)}")
+        Logger.warning("Failed to load persisted DAGs: #{inspect(error)}")
         state
     end
   end
 
-  defp persist_job_definition(job_id, job_config) do
-    alias Balsam.{Repo, Schema.JobDefinition}
+  defp load_dag_nodes(dag_def) do
+    try do
+      nodes_query = from(dn in DagNode, where: dn.dag_id == ^dag_def.dag_id)
+      dag_nodes = Repo.all(nodes_query)
 
-    attrs = JobDefinition.from_config(job_id, job_config)
+      {:ok, base_config} = DagDefinition.to_config(dag_def)
 
-    %JobDefinition{}
-    |> JobDefinition.changeset(attrs)
-    |> Repo.insert(on_conflict: :replace_all, conflict_target: :job_id)
+      nodes_map = dag_nodes
+      |> Enum.reduce(%{}, fn node, acc ->
+        node_id = String.to_existing_atom(node.node_id)
+        job_id = String.to_existing_atom(node.job_id)
+
+        node_config = %{
+          job_id: job_id,
+          depends_on: Enum.map(node.depends_on, &String.to_existing_atom/1),
+          condition_module: node.condition_module,
+          condition_function: node.condition_function
+        }
+
+        Map.put(acc, node_id, node_config)
+      end)
+
+      final_config = Map.put(base_config, :nodes, nodes_map)
+      {:ok, final_config}
+    rescue
+      error ->
+        {:error, error}
+    end
   end
 
-  defp update_job_last_run(job_id, last_run_time) do
-    try do
-      import Ecto.Query
-      alias Balsam.{Repo, Schema.JobDefinition}
+  defp persist_dag_definition(dag_id, dag_config) do
+    Repo.transaction(fn ->
+      # Insert/update DAG definition
+      dag_attrs = DagDefinition.from_config(dag_id, dag_config)
 
-      from(jd in JobDefinition, where: jd.job_id == ^to_string(job_id))
+      dag_result = %DagDefinition{}
+      |> DagDefinition.changeset(dag_attrs)
+      |> Repo.insert(on_conflict: :replace_all, conflict_target: :dag_id)
+
+      case dag_result do
+        {:ok, _dag_def} ->
+          # Delete existing nodes
+          from(dn in DagNode, where: dn.dag_id == ^to_string(dag_id))
+          |> Repo.delete_all()
+
+          # Insert new nodes
+          dag_config.nodes
+          |> Enum.each(fn {node_id, node_config} ->
+            node_attrs = %{
+              node_id: to_string(node_id),
+              dag_id: to_string(dag_id),
+              job_id: to_string(node_config.job_id),
+              depends_on: Enum.map(node_config[:depends_on] || [], &to_string/1),
+              condition_module: node_config[:condition_module],
+              condition_function: node_config[:condition_function],
+              node_config: inspect(node_config)
+            }
+
+            %DagNode{}
+            |> DagNode.changeset(node_attrs)
+            |> Repo.insert!()
+          end)
+
+          {:ok, :persisted}
+
+        {:error, reason} ->
+          Repo.rollback(reason)
+      end
+    end)
+  end
+
+  defp update_dag_last_run(dag_id, last_run_time) do
+    try do
+      from(dd in DagDefinition, where: dd.dag_id == ^to_string(dag_id))
       |> Repo.update_all(set: [last_run: last_run_time])
     rescue
       error ->
-        Logger.warning("Failed to update last run time for #{job_id}: #{inspect(error)}")
+        Logger.warning("Failed to update last run time for DAG #{dag_id}: #{inspect(error)}")
     end
+  end
+
+  defp get_latest_dag_run(dag_id) do
+    dag_id_str = to_string(dag_id)
+
+    DagRun
+    |> where([dr], dr.dag_id == ^dag_id_str)
+    |> order_by([dr], desc: dr.started_at)
+    |> limit(1)
+    |> Repo.one()
+  end
+
+  defp list_dag_runs(dag_id, opts) do
+    limit = Keyword.get(opts, :limit, 50)
+    dag_id_str = to_string(dag_id)
+
+    DagRun
+    |> where([dr], dr.dag_id == ^dag_id_str)
+    |> order_by([dr], desc: dr.started_at)
+    |> limit(^limit)
+    |> Repo.all()
   end
 
   @impl true
   def terminate(reason, state) do
-    Logger.info("Orchestrator terminating: #{inspect(reason)}")
+    Logger.info("DAG Orchestrator terminating: #{inspect(reason)}")
 
     if state.schedule_timer do
       Process.cancel_timer(state.schedule_timer)
     end
 
-    # Gracefully stop all running jobs
-    Enum.each(state.running_jobs, fn {_job_id, job_info} ->
-      Task.Supervisor.terminate_child(state.supervisor_pid, job_info.task_pid)
-      JobStorage.complete_job_run(job_info.job_run_id, :cancelled, nil, "Orchestrator shutdown")
+    # Cancel all running DAGs
+    Enum.each(state.running_dag_runs, fn {run_id, dag_run_info} ->
+      Enum.each(dag_run_info.running_nodes, fn {_node_id, job_ref} ->
+        Orchestrator.cancel_job(state.orchestrator_pid, job_ref)
+      end)
+
+      complete_dag_run(dag_run_info.dag_run_id, :cancelled, %{
+        cancelled_reason: "DAG Orchestrator shutdown"
+      })
+
+      Logger.info("Cancelled DAG run #{run_id} due to shutdown")
     end)
 
     :ok

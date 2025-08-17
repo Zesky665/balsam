@@ -1,49 +1,63 @@
 defmodule ETL.Analytics.UserBehavior do
-  @moduledoc """
-  User behavior analytics ETL pipeline.
-  """
+  @behaviour Balsam.Workflow
 
-  @behaviour Balsam.ETLJob
-
-  require Logger
-
-  @impl Balsam.ETLJob
-  def run(progress_callback \\ nil) do
-    Logger.info("Starting User Behavior ETL")
-
-    try do
-      if progress_callback, do: progress_callback.(1, 3, "Extracting user events")
-      :timer.sleep(1000)
-
-      if progress_callback, do: progress_callback.(2, 3, "Processing behavior patterns")
-      :timer.sleep(1000)
-
-      if progress_callback, do: progress_callback.(3, 3, "Loading analytics results")
-      :timer.sleep(1000)
-
-      result = %{
-        users_processed: 1000,
-        events_analyzed: 25000,
-        segments_created: 5,
-        completed_at: DateTime.utc_now()
+  @impl true
+  def workflow_config do
+    %{
+      name: "User Behavior Analytics Pipeline",
+      description: "Extract user data, analyze behavior, generate reports",
+      schedule: {:interval, :timer.hours(24)},
+      max_concurrent_nodes: 2,
+      nodes: %{
+        extract_users: %{
+          module: __MODULE__,
+          function: :extract_users,
+          args: [],
+          depends_on: []
+        },
+        extract_events: %{
+          module: __MODULE__,
+          function: :extract_events,
+          args: [],
+          depends_on: []
+        },
+        analyze_behavior: %{
+          module: __MODULE__,
+          function: :analyze_behavior,
+          args: [],
+          depends_on: [:extract_users, :extract_events]
+        },
+        generate_report: %{
+          module: __MODULE__,
+          function: :generate_report,
+          args: [],
+          depends_on: [:analyze_behavior]
+        }
       }
-
-      Logger.info("User Behavior ETL completed successfully")
-      {:ok, result}
-    rescue
-      error ->
-        Logger.error("User Behavior ETL failed: #{Exception.message(error)}")
-        {:error, error}
-    end
+    }
   end
 
-  @impl Balsam.ETLJob
-  def job_config do
-    %{
-      enable_progress: true,
-      max_retries: 2,
-      timeout: :timer.minutes(15),
-      schedule: {:interval, :timer.hours(6)}
-    }
+  def extract_users(_progress_callback \\ nil) do
+    IO.puts("📊 Extracting user data...")
+    :timer.sleep(1000)
+    {:ok, %{users_extracted: 1000}}
+  end
+
+  def extract_events(_progress_callback \\ nil) do
+    IO.puts("📈 Extracting event data...")
+    :timer.sleep(1000)
+    {:ok, %{events_extracted: 5000}}
+  end
+
+  def analyze_behavior(_progress_callback \\ nil) do
+    IO.puts("🧠 Analyzing user behavior...")
+    :timer.sleep(2000)
+    {:ok, %{insights: ["insight1", "insight2"]}}
+  end
+
+  def generate_report(_progress_callback \\ nil) do
+    IO.puts("📋 Generating behavior report...")
+    :timer.sleep(1000)
+    {:ok, %{report_generated: true}}
   end
 end

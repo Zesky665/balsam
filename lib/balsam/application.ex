@@ -7,24 +7,12 @@ defmodule Balsam.Application do
     Logger.info("Starting Balsam Application")
 
     children = [
-      # Start Ecto repository first
       Balsam.Repo,
-
-      # Start the job orchestrator
-      {Balsam.Orchestrator, [
+      {Balsam.Orchestrator, [  # This is the renamed DagOrchestrator
         name: Balsam.Orchestrator,
-        max_concurrent_jobs: 5
+        max_concurrent_dags: 5
       ]},
-
-      # Start the DAG orchestrator
-      {Balsam.DagOrchestrator, [
-        name: Balsam.DagOrchestrator,
-        orchestrator_pid: Balsam.Orchestrator,
-        max_concurrent_dags: 2
-      ]},
-
-      # Start the job loader (this will handle ETL job registration)
-      Balsam.StartupJobLoader
+      Balsam.StartupLoader
     ]
 
     opts = [strategy: :one_for_one, name: Balsam.Supervisor]
