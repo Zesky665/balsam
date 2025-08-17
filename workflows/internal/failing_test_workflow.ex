@@ -1,5 +1,5 @@
 # workflows/test/failing_test_workflow.ex
-defmodule Workflows.Test.FailingTestWorkflow do
+defmodule Workflows.Internal.FailingTestWorkflow do
   @behaviour Balsam.Workflow
 
   @moduledoc """

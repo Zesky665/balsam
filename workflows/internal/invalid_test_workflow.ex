@@ -1,5 +1,5 @@
 # workflows/test/invalid_test_workflow.ex
-defmodule Workflows.Test.InvalidTestWorkflow do
+defmodule Workflows.Internal.InvalidTestWorkflow do
   @behaviour Balsam.Workflow
 
   @moduledoc """

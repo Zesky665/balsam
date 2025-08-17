@@ -1,5 +1,5 @@
 # workflows/test/simple_test_job.ex
-defmodule Workflows.Test.SimpleTestJob do
+defmodule Workflows.Internal.SimpleTestJob do
   @behaviour Balsam.Workflow
 
   @moduledoc """

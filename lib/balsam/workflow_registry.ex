@@ -43,71 +43,24 @@ defmodule Balsam.WorkflowRegistry do
   Discover all workflow modules that implement @behaviour Balsam.Workflow
   """
   def discover_workflows do
-    :code.all_loaded()
-    |> Enum.filter(&workflow_module?/1)
+    Logger.debug("Starting workflow discovery...")
+
+    # First ensure all workflow files are compiled and loaded
+    ensure_all_workflow_files_loaded()
+
+    # Get all loaded modules and filter for workflows
+    workflows = :code.all_loaded()
+    |> Enum.map(fn {module_name, _} -> module_name end)
+    |> Enum.filter(&is_workflow_module?/1)
     |> Enum.map(&extract_workflow_config/1)
     |> Enum.filter(&(&1 != nil))
     |> Enum.sort_by(fn {workflow_id, _config} -> workflow_id end)
+
+    Logger.debug("Discovered #{length(workflows)} workflows: #{inspect(Enum.map(workflows, fn {id, _} -> id end))}")
+    workflows
   end
 
-  @doc """
-  Validate a workflow configuration
-  """
-  def validate_workflow_config(_workflow_id, workflow_config) do
-    with :ok <- validate_required_fields(workflow_config),
-         :ok <- validate_nodes_structure(workflow_config.nodes),
-         :ok <- validate_workflow_module(workflow_config) do
-      :ok
-    else
-      error -> error
-    end
-  end
-
-  @doc """
-  Test a workflow without actually running it
-  """
-  def test_workflow(workflow_id) do
-    case discover_workflows() |> Enum.find(fn {id, _} -> id == workflow_id end) do
-      nil ->
-        {:error, :workflow_not_found}
-
-      {^workflow_id, workflow_config} ->
-        case validate_workflow_config(workflow_id, workflow_config) do
-          :ok ->
-            try_dry_run(workflow_id, workflow_config)
-          error ->
-            error
-        end
-    end
-  end
-
-  @doc """
-  List all discovered workflows with their metadata
-  """
-  def list_workflows do
-    discover_workflows()
-    |> Enum.map(fn {workflow_id, config} ->
-      node_count = map_size(config[:nodes] || %{})
-      %{
-        workflow_id: workflow_id,
-        name: config[:name],
-        type: if(node_count == 1, do: :job, else: :dag),
-        node_count: node_count,
-        schedule: config[:schedule],
-        description: config[:description]
-      }
-    end)
-  end
-
-  @doc """
-  Get detailed information about a specific workflow
-  """
-  def get_workflow_info(workflow_id) do
-    case discover_workflows() |> Enum.find(fn {id, _} -> id == workflow_id end) do
-      nil -> {:error, :workflow_not_found}
-      {^workflow_id, config} -> {:ok, config}
-    end
-  end
+  # ... [rest of the existing functions remain the same until the private functions] ...
 
   ## Private Functions
 
@@ -163,13 +116,24 @@ defmodule Balsam.WorkflowRegistry do
     end
   end
 
-  defp workflow_module?({module_name, _loaded_from}) do
+  # FIXED: Better workflow module detection
+  defp is_workflow_module?(module_name) do
     try do
+      # Check if module implements Balsam.Workflow behavior
       implements_workflow_behavior?(module_name) and
-      not is_test_module?(module_name)
+      # Only exclude ExUnit test modules, not our workflow test modules
+      not is_exunit_module?(module_name)
     rescue
       _ -> false
     end
+  end
+
+  # FIXED: More precise test module filtering
+  defp is_exunit_module?(module_name) do
+    module_string = Atom.to_string(module_name)
+    # Only exclude actual ExUnit modules, not workflow modules that happen to have "Test" in the name
+    String.contains?(module_string, "ExUnit") or
+    String.ends_with?(module_string, "Test") and not String.contains?(module_string, "Workflow") and not String.contains?(module_string, "Job")
   end
 
   defp implements_workflow_behavior?(module_name) do
@@ -179,24 +143,36 @@ defmodule Balsam.WorkflowRegistry do
           behaviors = Keyword.get_values(attributes, :behaviour) ++
                      Keyword.get_values(attributes, :behavior)
           behaviors = List.flatten(behaviors)
-          Balsam.Workflow in behaviors
+          result = Balsam.Workflow in behaviors
+          if result do
+            Logger.debug("Found workflow behavior in #{module_name}")
+          end
+          result
         _ -> false
       end
     rescue
-      _ -> false
+      error ->
+        Logger.debug("Error checking behavior for #{module_name}: #{inspect(error)}")
+        false
     end
   end
 
   defp extract_workflow_config({module_name, _}) do
+    extract_workflow_config(module_name)
+  end
+
+  defp extract_workflow_config(module_name) when is_atom(module_name) do
     try do
       workflow_id = generate_workflow_id(module_name)
 
       workflow_config = try do
-        apply(module_name, :workflow_config, [])
-        |> Balsam.Workflow.merge_config()
+        config = apply(module_name, :workflow_config, [])
+        merged = Balsam.Workflow.merge_config(config)
+        Logger.debug("Successfully extracted config for #{module_name} -> #{workflow_id}")
+        merged
       rescue
-        _ ->
-          Logger.warning("#{module_name} implements Balsam.Workflow but workflow_config/0 failed")
+        error ->
+          Logger.warning("#{module_name} implements Balsam.Workflow but workflow_config/0 failed: #{inspect(error)}")
           nil
       end
 
@@ -219,6 +195,7 @@ defmodule Balsam.WorkflowRegistry do
     |> String.replace("ETL.", "")
     |> String.replace("Pipeline.", "")
     |> String.replace("DAG.", "")
+    |> String.replace("Workflows.", "")  # Add this to handle Workflows.Test.* modules
     |> String.replace(~r/([a-z])([A-Z])/, "\\1_\\2")
     |> String.downcase()
     |> String.replace(".", "_")
@@ -228,18 +205,12 @@ defmodule Balsam.WorkflowRegistry do
     |> String.to_atom()
   end
 
-  defp is_test_module?(module_name) do
-    module_string = Atom.to_string(module_name)
-    String.contains?(module_string, "Test") or
-    String.contains?(module_string, "Support") or
-    String.contains?(module_string, "ExUnit")
-  end
-
   defp is_single_node_workflow?(workflow_config) do
     nodes = workflow_config[:nodes] || %{}
     map_size(nodes) == 1 and Map.has_key?(nodes, :main)
   end
 
+  # FIXED: More comprehensive module loading
   defp ensure_modules_loaded do
     try do
       # Attempt to compile workflow files
@@ -248,12 +219,38 @@ defmodule Balsam.WorkflowRegistry do
         try do
           Code.compile_file(file)
         rescue
-          _ -> :ok  # Ignore compilation errors for individual files
+          error ->
+            Logger.debug("Could not compile #{file}: #{inspect(error)}")
         end
       end)
     rescue
       _ -> :ok
     end
+  end
+
+  # NEW: More thorough file loading for tests
+  defp ensure_all_workflow_files_loaded do
+    workflow_patterns = [
+      "workflows/**/*.ex",
+      "lib/**/workflow*.ex",
+      "lib/**/etl*.ex"
+    ]
+
+    workflow_patterns
+    |> Enum.flat_map(&Path.wildcard/1)
+    |> Enum.uniq()
+    |> Enum.each(fn file ->
+      try do
+        Code.compile_file(file)
+        Logger.debug("Compiled workflow file: #{file}")
+      rescue
+        error ->
+          Logger.debug("Could not compile #{file}: #{inspect(error)}")
+      end
+    end)
+
+    # Small delay to ensure modules are fully loaded
+    :timer.sleep(100)
   end
 
   defp get_workflow_modules do
@@ -262,10 +259,13 @@ defmodule Balsam.WorkflowRegistry do
       module_string = Atom.to_string(module_name)
       String.contains?(module_string, "ETL") or
       String.contains?(module_string, "Pipeline") or
-      String.contains?(module_string, "Workflow")
+      String.contains?(module_string, "Workflow") or
+      String.contains?(module_string, "Workflows")  # Add this
     end)
     |> Enum.map(fn {module_name, _} -> module_name end)
   end
+
+  # ... [rest of validation functions remain the same] ...
 
   ## Validation Functions
 
@@ -438,6 +438,67 @@ defmodule Balsam.WorkflowRegistry do
       else
         :no_cycle
       end
+    end
+  end
+
+  # Add missing public API functions that tests expect
+
+  @doc """
+  Validate a workflow configuration
+  """
+  def validate_workflow_config(_workflow_id, workflow_config) do
+    with :ok <- validate_required_fields(workflow_config),
+         :ok <- validate_nodes_structure(workflow_config.nodes),
+         :ok <- validate_workflow_module(workflow_config) do
+      :ok
+    else
+      error -> error
+    end
+  end
+
+  @doc """
+  Test a workflow without actually running it
+  """
+  def test_workflow(workflow_id) do
+    case discover_workflows() |> Enum.find(fn {id, _} -> id == workflow_id end) do
+      nil ->
+        {:error, :workflow_not_found}
+
+      {^workflow_id, workflow_config} ->
+        case validate_workflow_config(workflow_id, workflow_config) do
+          :ok ->
+            try_dry_run(workflow_id, workflow_config)
+          error ->
+            error
+        end
+    end
+  end
+
+  @doc """
+  List all discovered workflows with their metadata
+  """
+  def list_workflows do
+    discover_workflows()
+    |> Enum.map(fn {workflow_id, config} ->
+      node_count = map_size(config[:nodes] || %{})
+      %{
+        workflow_id: workflow_id,
+        name: config[:name],
+        type: if(node_count == 1, do: :job, else: :dag),
+        node_count: node_count,
+        schedule: config[:schedule],
+        description: config[:description]
+      }
+    end)
+  end
+
+  @doc """
+  Get detailed information about a specific workflow
+  """
+  def get_workflow_info(workflow_id) do
+    case discover_workflows() |> Enum.find(fn {id, _} -> id == workflow_id end) do
+      nil -> {:error, :workflow_not_found}
+      {^workflow_id, config} -> {:ok, config}
     end
   end
 end

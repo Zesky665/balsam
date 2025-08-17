@@ -1,5 +1,5 @@
 # workflows/test/data_pipeline_test.ex
-defmodule Workflows.Test.DataPipelineTest do
+defmodule Workflows.Internal.DataPipelineTest do
   @behaviour Balsam.Workflow
 
   @moduledoc """
