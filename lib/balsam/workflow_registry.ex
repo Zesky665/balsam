@@ -9,7 +9,7 @@ defmodule Balsam.WorkflowRegistry do
 
   def register_all do
     try do
-      ensure_modules_loaded()
+      ensure_all_workflow_files_loaded()
       :timer.sleep(200)
 
       workflows = discover_workflows()
@@ -45,10 +45,7 @@ defmodule Balsam.WorkflowRegistry do
   def discover_workflows do
     Logger.debug("Starting workflow discovery...")
 
-    # First ensure all workflow files are compiled and loaded
-    ensure_all_workflow_files_loaded()
-
-    # Get all loaded modules and filter for workflows
+    # No compilation here - assume it's already done
     workflows = :code.all_loaded()
     |> Enum.map(fn {module_name, _} -> module_name end)
     |> Enum.filter(&is_workflow_module?/1)
@@ -56,10 +53,9 @@ defmodule Balsam.WorkflowRegistry do
     |> Enum.filter(&(&1 != nil))
     |> Enum.sort_by(fn {workflow_id, _config} -> workflow_id end)
 
-    Logger.debug("Discovered #{length(workflows)} workflows: #{inspect(Enum.map(workflows, fn {id, _} -> id end))}")
+    Logger.debug("Discovered #{length(workflows)} workflows")
     workflows
   end
-
   # ... [rest of the existing functions remain the same until the private functions] ...
 
   ## Private Functions
@@ -107,7 +103,7 @@ defmodule Balsam.WorkflowRegistry do
       |> JobDefinition.changeset(attrs)
       |> Repo.insert(on_conflict: :replace_all, conflict_target: :job_id)
 
-      Logger.debug("Registered job definition for #{workflow_id}")
+      # Logger.debug("Registered job definition for #{workflow_id}")
       :ok
     rescue
       error ->
@@ -144,9 +140,9 @@ defmodule Balsam.WorkflowRegistry do
                      Keyword.get_values(attributes, :behavior)
           behaviors = List.flatten(behaviors)
           result = Balsam.Workflow in behaviors
-          if result do
-            Logger.debug("Found workflow behavior in #{module_name}")
-          end
+          # if result do
+          #   Logger.debug("Found workflow behavior in #{module_name}")
+          # end
           result
         _ -> false
       end
@@ -168,7 +164,7 @@ defmodule Balsam.WorkflowRegistry do
       workflow_config = try do
         config = apply(module_name, :workflow_config, [])
         merged = Balsam.Workflow.merge_config(config)
-        Logger.debug("Successfully extracted config for #{module_name} -> #{workflow_id}")
+        # Logger.debug("Successfully extracted config for #{module_name} -> #{workflow_id}")
         merged
       rescue
         error ->
@@ -210,47 +206,31 @@ defmodule Balsam.WorkflowRegistry do
     map_size(nodes) == 1 and Map.has_key?(nodes, :main)
   end
 
-  # FIXED: More comprehensive module loading
-  defp ensure_modules_loaded do
-    try do
-      # Attempt to compile workflow files
-      workflow_files = Path.wildcard("workflows/**/*.ex")
-      Enum.each(workflow_files, fn file ->
-        try do
-          Code.compile_file(file)
-        rescue
-          error ->
-            Logger.debug("Could not compile #{file}: #{inspect(error)}")
-        end
-      end)
-    rescue
-      _ -> :ok
-    end
-  end
-
-  # NEW: More thorough file loading for tests
   defp ensure_all_workflow_files_loaded do
-    workflow_patterns = [
-      "workflows/**/*.ex",
-      "lib/**/workflow*.ex",
-      "lib/**/etl*.ex"
-    ]
-
-    workflow_patterns
-    |> Enum.flat_map(&Path.wildcard/1)
-    |> Enum.uniq()
+    "workflows/**/*.ex"
+    |> Path.wildcard()
+    |> Enum.filter(&contains_workflow_behavior?/1)
     |> Enum.each(fn file ->
       try do
         Code.compile_file(file)
         Logger.debug("Compiled workflow file: #{file}")
       rescue
         error ->
-          Logger.debug("Could not compile #{file}: #{inspect(error)}")
+          Logger.warning("Failed to compile workflow file #{file}: #{inspect(error)}")
       end
     end)
 
-    # Small delay to ensure modules are fully loaded
     :timer.sleep(100)
+  end
+
+  defp contains_workflow_behavior?(file_path) do
+    try do
+      file_path
+      |> File.read!()
+      |> String.contains?("@behaviour Balsam.Workflow")
+    rescue
+      _ -> false
+    end
   end
 
   defp get_workflow_modules do
