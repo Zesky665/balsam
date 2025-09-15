@@ -27,3 +27,7 @@ be found at <https://hexdocs.pm/balsam>.
   - Create GenServer
   - 
 
+status = Balsam.Orchestrator.get_status()
+Balsam.Orchestrator.run_job(:jokes_jokes_etl)
+Balsam.Orchestrator.run_dag(:internal_data_pipeline_test)
+workflows = Balsam.WorkflowRegistry.register_all
