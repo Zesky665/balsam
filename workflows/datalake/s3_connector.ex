@@ -1,4 +1,4 @@
-defmodule ETL.DataLake.S3Connector do
+defmodule Workflows.DataLake.S3Connector do
   @moduledoc """
   S3 operations for data lake ingestion.
   This is a HELPER module - NOT registered as a job.

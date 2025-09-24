@@ -1,7 +1,29 @@
-defmodule ETL.Jokes.JokesETL do
+defmodule Workflows.Jokes.JokesETL do
   alias Explorer.DataFrame, as: DF
   import Enum
   import Req
+
+  @behaviour Balsam.Workflow
+
+    @impl true
+  def workflow_config do
+    %{
+      name: "Joke Job",
+      description: "A basic single-node workflow for testing",
+      schedule: :manual,
+      enable_progress: true,
+      max_retries: 2,
+      timeout: :timer.minutes(5),
+      nodes: %{
+        main: %{
+          module: __MODULE__,
+          function: :run,
+          args: [],
+          depends_on: []
+        }
+      }
+    }
+  end
 
   @moduledoc """
   Simple jokes ETL pipeline.
@@ -33,11 +55,8 @@ defmodule ETL.Jokes.JokesETL do
     DF.to_csv(data, "data/jokes/jokes.csv")
   end
 
-  def main() do
-    main(nil)
-  end
-
-  def main(_progress_callback) do
+  @impl true
+  def run(progress_callback \\ nil) do
     url = "https://official-joke-api.appspot.com/jokes/programming/ten"
     url |> fetch_data() |> transform_data() |> export_data()
     :ok

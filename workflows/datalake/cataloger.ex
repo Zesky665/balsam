@@ -1,4 +1,4 @@
-defmodule ETL.DataLake.Cataloger do
+defmodule Workflows.DataLake.Cataloger do
   require Logger
 
   def update_catalog(ingested_files) do
